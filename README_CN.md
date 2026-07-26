@@ -1,4 +1,6 @@
-# 连接日志分类引擎 — 架构说明（交接文档）
+# SentinelX
+
+**连接日志分类引擎 — 架构说明（交接文档）**
 
 > English version: [README.md](README.md)
 
@@ -25,26 +27,14 @@
 两者共用同一套解析、跨天关联、机队抑制、报告渲染逻辑（各自复制，保持文件独立）。
 `classify_info_logs.py` 会 `import classify_logs` 来复用 warning 引擎做交叉比对。
 
-## 3. 数据 / 目录布局
+## 3. 输入
 
-```
-Archive/
-  classify_logs.py, classify_info_logs.py
-  info_YYYY-MM-DD/raw/<SERVER>.txt         # 输入
-  info_YYYY-MM-DD/result/<SERVER>.txt      # 每节点每日输出（脚本生成）
-  warning_YYYY-MM-DD/raw|result/...
-  FLEET_SUMMARY_info.txt                   # 跨天总览（脚本生成）
-  FLEET_SUMMARY_warning.txt
-```
+每台节点每种日志每天产出一份 24 小时快照，已按
+`origin(内网源IP) → 目的地(host:port) → 次数` 聚合。引擎自动发现所有可用日期并全部载入，**无需参数**。
 
-脚本自动发现所有 `info_*` / `warning_*` 日期目录并全部载入；**无需参数**。
-
-### 输入行格式
-- origin 行：`10.111.111.96  17189`（IP + 2 个以上空格 + 总次数）
-- 目的地行：`  1.1.1.1:53: 1664`（缩进 + host:port + 次数）
-- 排除行：`  [excluded: 1.1.1.1:53, 40069 hits, 77.6% ...]` —— 原报告把占比≥75% 的单一目的地
-  当「高频噪音」剔除。引擎用 `effective_dests()` 把它**重新纳入检测**（否则一片 telnet 洪水
-  若被当噪音剔除就会整条漏判），但不改变 total 计数语义。
+原始导出有一点对算法有影响：它会把占某 origin 流量 ≥75% 的单一目的地当「高频噪音」剔除。
+`effective_dests()` 在检测前**把这条目的地重新放回来**（否则一片 telnet 洪水若被当噪音剔除
+就会整条漏判），但不改变 total 计数语义。
 
 ## 4. 严重度模型
 
@@ -143,9 +133,9 @@ CLEAN  <  WATCH  <  SUSPICIOUS  <  MALICIOUS
 python classify_logs.py        # 先跑，供 info 交叉比对
 python classify_info_logs.py
 ```
-输出：各日期 `result/<SERVER>.txt` + 根目录 `FLEET_SUMMARY_{info,warning}.txt`。
-FLEET_SUMMARY 每条名单项带「触发」（命中什么规则、规模、阈值）+「定级」（为何是该级别 /
-跨天判定）两行说明。
+两者各自输出每日每节点的报告，以及一份机队级跨天总览。每条命中项都带两行说明：
+**触发**（命中什么规则、规模、阈值）与**定级**（为何是该级别 / 跨天判定结论）——
+判定理由始终可以只凭输出复原。
 
 ## 11. 已知边界 / 设计取舍
 
@@ -155,3 +145,17 @@ FLEET_SUMMARY 每条名单项带「触发」（命中什么规则、规模、阈
 - 升级需≥3 个**连续自然日**都有数据且都判可疑；**断断续续的可疑（中间有 clean/缺数据）不会升级**，
   这是刻意为之（"连续"语义）。
 - 「持续性本身也可能是威胁」这一点：当前仅对「持续+换目标」升级；对「持续+固定目标」判 WATCH。
+
+## 12. 许可协议
+
+SentinelX 采用
+[知识共享 署名-非商业性使用 4.0 国际许可协议（CC BY-NC 4.0）](LICENSE) 发布。
+
+你可以自由地**使用、修改、再分发**本代码，但须满足：
+
+- **署名（Attribution）** —— 必须注明 **Uzumaru** 与 **SentinelX** 项目，附上许可协议链接，
+  并说明是否作过修改。
+- **非商业性使用（NonCommercial）** —— **不得**用于商业目的，包括出售本代码、出售基于本代码的
+  服务，或将其打包进付费产品。
+
+版权所有 © 2026 Uzumaru。

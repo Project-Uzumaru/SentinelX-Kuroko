@@ -1,4 +1,6 @@
-# Connection Log Classification Engine — Architecture (Handover Doc)
+# SentinelX
+
+**Connection Log Classification Engine — Architecture (Handover Doc)**
 
 > 中文版本：[README_CN.md](README_CN.md)
 
@@ -30,28 +32,16 @@ Both share the same parsing, cross-day correlation, fleet suppression, and repor
 (each keeps its own copy so the files stay standalone).
 `classify_info_logs.py` does `import classify_logs` to reuse the warning engine for cross-referencing.
 
-## 3. Data / directory layout
+## 3. Input
 
-```
-Archive/
-  classify_logs.py, classify_info_logs.py
-  info_YYYY-MM-DD/raw/<SERVER>.txt         # input
-  info_YYYY-MM-DD/result/<SERVER>.txt      # per-node, per-day output (script-generated)
-  warning_YYYY-MM-DD/raw|result/...
-  FLEET_SUMMARY_info.txt                   # cross-day overview (script-generated)
-  FLEET_SUMMARY_warning.txt
-```
+Each node produces one 24h snapshot per log kind per day, already aggregated as
+`origin (internal source IP) → destination (host:port) → hit count`. The engine auto-discovers every
+available date and loads them all; no arguments needed.
 
-The scripts auto-discover every `info_*` / `warning_*` date directory and load them all;
-**no arguments needed**.
-
-### Input line format
-- origin line: `10.111.111.96  17189` (IP + 2 or more spaces + total hit count)
-- destination line: `  1.1.1.1:53: 1664` (indent + host:port + hit count)
-- excluded line: `  [excluded: 1.1.1.1:53, 40069 hits, 77.6% ...]` — the original report strips out any
-  single destination accounting for ≥75% of traffic as "high-frequency noise". The engine uses
-  `effective_dests()` to **bring it back into detection** (otherwise an entire telnet flood written off
-  as noise would be missed wholesale), without changing the semantics of the total count.
+One quirk of the upstream export matters algorithmically: it strips out any single destination
+accounting for ≥75% of an origin's traffic, labelling it "high-frequency noise". `effective_dests()`
+**puts that destination back before detection runs** — otherwise an entire telnet flood written off
+as noise would be missed wholesale — without changing the semantics of the total count.
 
 ## 4. Severity model
 
@@ -172,9 +162,10 @@ verdict produced by single-day counts.
 python classify_logs.py        # run first, so info can cross-reference it
 python classify_info_logs.py
 ```
-Output: per-date `result/<SERVER>.txt` files plus `FLEET_SUMMARY_{info,warning}.txt` in the root.
-Every entry in FLEET_SUMMARY carries two explanation lines: "trigger" (which rule matched, at what
-scale, against what threshold) and "rating" (why this severity / what the cross-day judgment was).
+Both write a per-node report for each date plus a fleet-wide cross-day summary. Every flagged entry
+carries two explanation lines: **trigger** (which rule matched, at what scale, against what threshold)
+and **rating** (why this severity / what the cross-day judgment was) — the reasoning is always
+reconstructable from the output alone.
 
 ## 11. Known boundaries / design trade-offs
 
@@ -189,3 +180,17 @@ scale, against what threshold) and "rating" (why this severity / what the cross-
   deliberate ("consecutive" semantics).
 - On the point that "persistence itself can also be a threat": currently only "persistent + rotating
   targets" escalates; "persistent + fixed targets" is judged WATCH.
+
+## 12. License
+
+SentinelX is released under the
+[Creative Commons Attribution-NonCommercial 4.0 International License (CC BY-NC 4.0)](LICENSE).
+
+You are free to **use, modify, and redistribute** this code, provided that:
+
+- **Attribution** — you give appropriate credit to **Uzumaru** and the **SentinelX** project,
+  include a link to the license, and indicate whether you made changes.
+- **NonCommercial** — you may **not** use it for commercial purposes, including selling it,
+  selling a service built on it, or bundling it into a paid product.
+
+Copyright © 2026 Uzumaru.
