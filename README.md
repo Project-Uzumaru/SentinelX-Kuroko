@@ -1,13 +1,33 @@
-# SentinelX
+# SentinelX Kuroko
 
 **Connection Log Classification Engine — Architecture (Handover Doc)**
 
 > 中文版本：[README_CN.md](README_CN.md)
 
-This directory holds two independent but structurally symmetric Python scripts that perform
+This repository holds two independent but structurally symmetric Python scripts that perform
 security classification on connection logs from an IDC fleet.
 This document lets a future maintainer (human or AI) understand the design without reading
 all the code.
+
+## 0. Where this repo sits in SentinelX
+
+**SentinelX as a whole is not open source.** To avoid confusion, the project has been split into
+two separate repositories, and **only SentinelX Kuroko — this repository — is open source**:
+
+| Component | Responsibility | Status |
+|---|---|---|
+| **SentinelX Misaka** | Data collection and network control: raw data acquisition, traffic interception, website blocking, connection logging, and other related security functions | **Closed source** |
+| **SentinelX Kuroko** (this repo) | The log analysis algorithm that classifies the collected connection logs | **Open source** (CC BY-NC 4.0) |
+
+Kuroko consumes the connection logs that Misaka produces, but it has no dependency on Misaka's
+code: it reads plain text snapshots off disk (see §3) and is fully runnable on its own.
+
+### Versioning
+
+Because of the split, the previous unified version numbers no longer apply. **Misaka and Kuroko now
+keep independent version histories, both restarting from `v1.0.0`.** The two version numbers are
+unrelated and are **not** expected to stay in sync — each repository follows its own development and
+release cycle.
 
 ## 1. What problem it solves
 
@@ -34,9 +54,11 @@ Both share the same parsing, cross-day correlation, fleet suppression, and repor
 
 ## 3. Input
 
-Each node produces one 24h snapshot per log kind per day, already aggregated as
+Each node produces one 24h snapshot per log kind per day (this is the SentinelX Misaka side of the
+system), already aggregated as
 `origin (internal source IP) → destination (host:port) → hit count`. The engine auto-discovers every
-available date and loads them all; no arguments needed.
+available date and loads them all; no arguments needed. Any log source that emits the same aggregated
+text format works — Misaka is not required to run Kuroko.
 
 One quirk of the upstream export matters algorithmically: it strips out any single destination
 accounting for ≥75% of an origin's traffic, labelling it "high-frequency noise". `effective_dests()`
@@ -183,14 +205,17 @@ reconstructable from the output alone.
 
 ## 12. License
 
-SentinelX is released under the
+**SentinelX Kuroko** is released under the
 [Creative Commons Attribution-NonCommercial 4.0 International License (CC BY-NC 4.0)](LICENSE).
 
 You are free to **use, modify, and redistribute** this code, provided that:
 
-- **Attribution** — you give appropriate credit to **Uzumaru** and the **SentinelX** project,
+- **Attribution** — you give appropriate credit to **Uzumaru** and the **SentinelX Kuroko** project,
   include a link to the license, and indicate whether you made changes.
 - **NonCommercial** — you may **not** use it for commercial purposes, including selling it,
   selling a service built on it, or bundling it into a paid product.
+
+This license covers **this repository only**. **SentinelX Misaka and the complete SentinelX system
+remain closed source** and are not licensed under CC BY-NC 4.0.
 
 Copyright © 2026 Uzumaru.

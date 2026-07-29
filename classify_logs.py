@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-# SentinelX — Copyright (c) 2026 Uzumaru
+# SentinelX Kuroko — Copyright (c) 2026 Uzumaru
 # SPDX-License-Identifier: CC-BY-NC-4.0
-# 可自由使用/修改/再分发，须署名 Uzumaru 与 SentinelX，且不得用于商业目的。详见 LICENSE。
+# 可自由使用/修改/再分发，须署名 Uzumaru 与 SentinelX Kuroko，且不得用于商业目的。详见 LICENSE。
 """连接日志分类引擎 —— 失败连接（warning）版。
 
 数据现在是「每天一份的 24 小时快照」，目录形如:
