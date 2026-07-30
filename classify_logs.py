@@ -1,7 +1,4 @@
 # -*- coding: utf-8 -*-
-# SentinelX Kuroko — Copyright (c) 2026 Uzumaru
-# SPDX-License-Identifier: CC-BY-NC-4.0
-# 可自由使用/修改/再分发，须署名 Uzumaru 与 SentinelX Kuroko，且不得用于商业目的。详见 LICENSE。
 """连接日志分类引擎 —— 失败连接（warning）版。
 
 数据现在是「每天一份的 24 小时快照」，目录形如:
@@ -21,11 +18,45 @@ from collections import defaultdict
 BASE_DIR = Path(__file__).resolve().parent
 
 ORIGIN_RE = re.compile(r"^(\S+)\s{2,}(\d+)\s*$")
-DEST_RE = re.compile(r"^\s+(\S+?):(\d+):\s*(\d+)\s*$")
+# 目的地行：host:port: count，>=2 次命中时可能带一段可选的时间戳后缀
+# [t 首次~末次 avg=平均间隔(秒/分钟/小时) secs=命中的不同秒数]（2026-07-29 起新增字段）。
+# 后缀整体可选，兼容没有该字段的旧格式/单次命中行。
+DEST_RE = re.compile(
+    r"^\s+(\S+?):(\d+):\s*(\d+)"
+    r"(?:\s*\[t\s+(\d{2}:\d{2}:\d{2})~(\d{2}:\d{2}:\d{2})\s+avg=([\d.]+)(秒|分钟|小时)\s+secs=(\d+)\])?"
+    r"\s*$"
+)
 EXCLUDED_RE = re.compile(
     r"^\s+\[excluded:\s*(\S+?):(\d+),\s*(\d+)\s*hits,\s*([\d.]+)%.*\]\s*$"
 )
 IPV4_RE = re.compile(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$")
+_AVG_UNIT_SEC = {"秒": 1.0, "分钟": 60.0, "小时": 3600.0}
+
+
+def _hhmmss_to_sec(s):
+    h, m, sec = (int(x) for x in s.split(":"))
+    return h * 3600 + m * 60 + sec
+
+
+def _timing_desc(dests, domains):
+    """从候选目的地（命中最多、且带时间戳字段的那个）拼一句时间分布描述，仅用于丰富
+    reason 文案给人工复核参考，不参与任何判定阈值——新旧数据都验证过，鉴权请求本身
+    经常是短时间小突发，突发本身不是可疑信号。没有时间戳数据（旧格式/单次命中）返回 None。"""
+    candidates = [d for d in dests if d.host in domains and d.first_s is not None]
+    if not candidates:
+        return None
+    d = max(candidates, key=lambda x: x.count)
+    span = d.last_s - d.first_s
+    fh, fm, fs = d.first_s // 3600, (d.first_s % 3600) // 60, d.first_s % 60
+    lh, lm, ls = d.last_s // 3600, (d.last_s % 3600) // 60, d.last_s % 60
+    if d.avg_sec < 60:
+        avg_str = f"{d.avg_sec:.1f} 秒"
+    elif d.avg_sec < 3600:
+        avg_str = f"{d.avg_sec / 60:.1f} 分钟"
+    else:
+        avg_str = f"{d.avg_sec / 3600:.1f} 小时"
+    return (f"时间分布：{d.host} 当日请求集中在 {fh:02d}:{fm:02d}:{fs:02d}~{lh:02d}:{lm:02d}:{ls:02d}"
+            f"（跨度约 {span / 3600:.1f} 小时），平均间隔 {avg_str}（仅供参考，不参与判定）。")
 
 # 横向扫描：一个内网 origin 在某高危端口上打了多少个「互不相关的公网 IP」。
 # 这些端口正常客户端几乎不会主动外连，撞见就异常，与数据跨度无关，
@@ -70,6 +101,12 @@ OPENAI_USAGE_DOMAINS = {
 }
 OPENAI_AUTH_MIN_HITS = 300      # 当日鉴权域名合计次数门槛，远超真人偶尔登录/刷新的量级
 OPENAI_USAGE_MAX_RATIO = 0.05   # 产品域名次数占（鉴权+产品）总量的上限；超过此比例视为「有在正常使用」
+# 跨天真实使用核实：若同一 (server, origin IP) 在任意其它已加载日期的产品域名命中数
+# >= 此值，说明这是个真实在用产品的用户，当天 0%/低产品占比更可能是「当天只刷新了
+# token、没怎么聊天」，而不是从未用过产品的注册机——命中则把该轴判定降级为 WATCH。
+# 取值远高于偶发噪音（个别 CDN/共享代理误蹭到 1-2 次产品域名），远低于真实 farm
+# 案例（目前已确认的案例里，这些天从未出现过任何产品域名命中）。
+OPENAI_CROSSDAY_USAGE_MIN = 50
 
 # 域名目的地分布过散：本引擎其它轴都不对域名计数（避免误杀 REALITY/SNI 借用流量），
 # 但「当天访问的不同域名多、且没有任何一个域名占主导」本身也是一种值得关注的模式——
@@ -79,6 +116,18 @@ OPENAI_USAGE_MAX_RATIO = 0.05   # 产品域名次数占（鉴权+产品）总量
 # 用户（正常浏览哪怕挂了很多广告/统计域名，通常也有 1-2 个主域名占比明显更高）。
 DOMAIN_SCATTER_MIN_DISTINCT = 300   # 当日不同域名目的地数门槛
 DOMAIN_SCATTER_MAX_TOP_SHARE = 0.10  # 最大单域名次数占「全部域名次数」的上限
+
+# 域名并发异常：域名目的地本来对本引擎所有威胁轴免疫（见上，避免误杀 REALITY/SNI 借用
+# 流量），这是唯一的例外。用 count/distinct_secs（同一域名当日命中数 / 命中的不同秒数）
+# 衡量"是否有多次命中砸进同一秒"——用 2026-07-29 起新增的时间戳字段，对全量数据（含
+# 已知 REALITY 借用 SNI 的 visa.cn/qualcomm.cn，以及不限定的全体域名，29635 个
+# count>=20 且带时间戳的样本）实测校准：这个比值从未超过 1.833，REALITY 心跳本身该值
+# 恒为 1.0（心跳低频且从不并发）。说明无论是 REALITY 隧道保活还是正常网页/CDN 访问，
+# 同一秒内都几乎不会被同一域名命中两次以上；真出现比值≥2 的情况，是"大家都不这样、
+# 就它这样"的统计异常，更像脚本/工具在对该域名发起多线程并发连接，而不是浏览器/
+# 正常客户端行为。只对单个域名的并发比值判定，不影响 REALITY/SNI 域名豁免的整体设计。
+DOMAIN_CONCURRENCY_MIN_HITS = 20     # 当日命中数门槛（太小的样本比值本身就不稳定）
+DOMAIN_CONCURRENCY_RATIO_MIN = 2.0   # count/distinct_secs 并发比值门槛
 
 # 机队共享域名白名单：与 IP 版机队共享（FLEET_SHARED_MIN_SERVERS）同一思路，但域名的
 # 长尾比 IP:port 长得多——用当前 87 台 server、11 天全量数据校准：不同域名出现的 server
@@ -109,7 +158,7 @@ KNOWN_SERVICE_HINTS = [
     "mapbox", "nvidia", "visa", "qualcomm", "toutiao", "ipify", "ip.sb",
 ]
 
-SEV_ORDER = {"CLEAN": 0, "WATCH": 1, "SUSPICIOUS": 2, "MALICIOUS": 3}
+SEV_ORDER = {"CLEAN": 0, "INFO": 1, "WATCH": 2, "SUSPICIOUS": 3, "MALICIOUS": 4}
 
 
 def sev_max(a, b):
@@ -124,12 +173,16 @@ def is_ipv4(host):
 
 
 class Dest:
-    __slots__ = ("host", "port", "count")
+    __slots__ = ("host", "port", "count", "first_s", "last_s", "avg_sec", "distinct_secs")
 
-    def __init__(self, host, port, count):
+    def __init__(self, host, port, count, first_s=None, last_s=None, avg_sec=None, distinct_secs=None):
         self.host = host
         self.port = port
         self.count = count
+        self.first_s = first_s          # 当天首次命中，秒数（0-86399），无时间戳字段则为 None
+        self.last_s = last_s            # 当天末次命中，秒数
+        self.avg_sec = avg_sec          # 平均命中间隔，统一换算成秒
+        self.distinct_secs = distinct_secs  # 有命中的不同秒数（判断是否多次命中压在同一秒）
 
 
 class Origin:
@@ -165,8 +218,13 @@ def parse_file(path):
 
             m_dest = DEST_RE.match(line)
             if m_dest and current is not None:
-                host, port, count = m_dest.groups()
-                current.dests.append(Dest(host, int(port), int(count)))
+                host, port, count, first_t, last_t, avg_v, avg_u, secs = m_dest.groups()
+                first_s = _hhmmss_to_sec(first_t) if first_t else None
+                last_s = _hhmmss_to_sec(last_t) if last_t else None
+                avg_sec = float(avg_v) * _AVG_UNIT_SEC[avg_u] if avg_v else None
+                distinct_secs = int(secs) if secs else None
+                current.dests.append(
+                    Dest(host, int(port), int(count), first_s, last_s, avg_sec, distinct_secs))
                 continue
 
             m_origin = ORIGIN_RE.match(line)
@@ -305,19 +363,23 @@ def analyze_origin(origin, fleet_shared_domains=frozenset()):
     if auth_hits >= OPENAI_AUTH_MIN_HITS:
         ratio = usage_hits / (auth_hits + usage_hits) if (auth_hits + usage_hits) else 0.0
         if ratio <= OPENAI_USAGE_MAX_RATIO:
+            reason = (
+                f"该 origin 当日对 OpenAI/ChatGPT 鉴权域名（auth.openai.com 等）发起 {auth_hits} 次连接，"
+                f"同期对实际聊天/API 域名（chat.openai.com/api.openai.com 等）的访问量仅 {usage_hits} 次"
+                f"（产品占比 {ratio:.1%}）。正常用户即使经代理/中转访问量很大，鉴权流量也应远小于实际"
+                f"产品使用量——只反复走鉴权流程、几乎不用产品本身，是账号注册机/token 农场的典型特征。"
+                f"本判定基于当日总连接数比例（日志无请求路径），建议人工核实。"
+            )
+            timing = _timing_desc(dests, OPENAI_AUTH_DOMAINS)
+            if timing:
+                reason += f" {timing}"
             findings.append({
                 "axis": "openai_auth", "port": None, "target": None,
                 "key_set": frozenset(["openai_auth"]),
                 "sev": "SUSPICIOUS", "kind": "threat",
                 "detail": (f"  OpenAI/ChatGPT 鉴权域名 {auth_hits} 次 vs 产品域名(chat/api) {usage_hits} 次"
                            f"（产品占比 {ratio:.1%}）"),
-                "reason": (
-                    f"该 origin 当日对 OpenAI/ChatGPT 鉴权域名（auth.openai.com 等）发起 {auth_hits} 次连接，"
-                    f"同期对实际聊天/API 域名（chat.openai.com/api.openai.com 等）的访问量仅 {usage_hits} 次"
-                    f"（产品占比 {ratio:.1%}）。正常用户即使经代理/中转访问量很大，鉴权流量也应远小于实际"
-                    f"产品使用量——只反复走鉴权流程、几乎不用产品本身，是账号注册机/token 农场的典型特征。"
-                    f"本判定基于当日总连接数比例（日志无请求路径），建议人工核实。"
-                ),
+                "reason": reason,
             })
 
     # --- 轴 5：域名目的地分布过散 ---
@@ -336,7 +398,7 @@ def analyze_origin(origin, fleet_shared_domains=frozenset()):
             findings.append({
                 "axis": "domain_scatter", "port": None, "target": None,
                 "key_set": frozenset(["domain_scatter"]),
-                "sev": "WATCH", "kind": "threat",
+                "sev": "INFO", "kind": "threat",
                 "detail": (f"  域名目的地分布很散(已剔除机队共享域名): {n_domains} 个不同域名，"
                            f"最大单域名占比 {top_share:.1%}（{top_host}），域名合计 {total_domain_hits} 次"),
                 "reason": (
@@ -346,8 +408,31 @@ def analyze_origin(origin, fleet_shared_domains=frozenset()):
                     f"（最大的是 {top_host}，占 {top_share:.1%}）。本引擎其它轴都不对域名计数（避免"
                     f"误杀 REALITY/SNI 借用流量），但这种「域名很多、没有主导目标、还都不是机队通用"
                     f"基础设施」的分布本身也值得关注——可能是共享代理/中转在承载很多不同真实用户的"
-                    f"流量（良性），也可能是批量探测/自动化访问大量域名。暂归为 WATCH（观察级），"
-                    f"不计入威胁告警，建议留意是否持续。"
+                    f"流量（良性），也可能是批量探测/自动化访问大量域名。暂归为 INFO（信息级，"
+                    f"比 WATCH 更低，单独成栏），不计入威胁告警，建议留意是否持续。"
+                ),
+            })
+
+    # --- 轴 6：域名并发异常（域名目的地唯一的例外，其它轴仍对域名免疫）---
+    for d in dests:
+        if is_ipv4(d.host) or d.distinct_secs is None or d.count < DOMAIN_CONCURRENCY_MIN_HITS:
+            continue
+        ratio = d.count / d.distinct_secs
+        if ratio >= DOMAIN_CONCURRENCY_RATIO_MIN:
+            findings.append({
+                "axis": "domain_concurrency", "port": None, "target": d.host,
+                "key_set": frozenset([d.host]),
+                "sev": "SUSPICIOUS", "kind": "threat",
+                "detail": (f"  域名并发异常: {d.host} 当日 {d.count} 次命中仅落在 {d.distinct_secs} 个不同秒内"
+                           f"（并发比值 {ratio:.2f}）"),
+                "reason": (
+                    f"该 origin 当日对域名 {d.host} 发起 {d.count} 次连接，但只分布在 {d.distinct_secs} 个"
+                    f"不同的秒内（并发比值 {ratio:.2f}）。用全量真实数据校准过：不管是 REALITY 借用 SNI"
+                    f"的心跳流量还是普通网页/CDN 访问，这个比值从未超过 1.833——同一秒内反复并发命中"
+                    f"同一域名不是浏览器/正常客户端的行为模式，更像脚本/工具在对该域名发起多线程并发"
+                    f"连接。这是域名目的地在本引擎里唯一参与判定的信号（其它轴仍对域名免疫，不影响"
+                    f"REALITY/SNI 借用域名的整体豁免——REALITY 心跳低频且从不并发，比值恒为 1，不会"
+                    f"触发这条）。"
                 ),
             })
 
@@ -393,7 +478,7 @@ def _novelty(tgt, pool):
     return len(tgt - set(pool)) / len(tgt)
 
 
-def apply_cross_day(all_findings, all_dates):
+def apply_cross_day(all_findings, all_dates, usage_by_day=None):
     """跨天关联，逐天沿时间线判定，注入 finding['final_sev'] 与 ['repeat_note']。
 
     对每个 (server, origin, axis, port/target) 签名：
@@ -403,12 +488,35 @@ def apply_cross_day(all_findings, all_dates):
       - 连续可疑计数 >= ESCALATE_STREAK_DAYS → 升级 MALICIOUS（持续换目标扫描）；
       - 缺数据/CLEAN/WATCH 的那天都会打断连续计数。
     最后对『未升级、跨多天、且始终是老池子子集』的签名回溯降级为 WATCH，
-    避免首次出现那天因无历史可比而被误判可疑。"""
+    避免首次出现那天因无历史可比而被误判可疑。
+
+    openai_auth 轴单独处理：不参与上面的 novelty/streak 逻辑（鉴权域名本身是固定的
+    一两个域名，没有"目标"概念），而是核实同一 (server, origin IP) 在其它任意已加载
+    日期是否有过 >=OPENAI_CROSSDAY_USAGE_MIN 次真实产品域名访问——命中说明这是个真实
+    用户，只是当天没怎么用产品，降级为 WATCH；否则维持原判。"""
     ordered = sorted(all_dates)
+    usage_by_day = usage_by_day or {}
 
     groups = defaultdict(dict)  # gkey -> {date: finding}
     for (date, server, oip), flist in all_findings.items():
         for f in flist:
+            if f["kind"] == "threat" and f["axis"] == "openai_auth":
+                other = usage_by_day.get((server, oip), {})
+                best_day, best_usage = None, 0
+                for d2, uh in other.items():
+                    if d2 != date and uh > best_usage:
+                        best_day, best_usage = d2, uh
+                if best_usage >= OPENAI_CROSSDAY_USAGE_MIN:
+                    f["final_sev"] = "WATCH"
+                    f["repeat_note"] = (
+                        f"该 origin 在 {best_day} 有 {best_usage} 次真实产品域名(chat/api)访问记录——"
+                        f"是真实在用产品的用户，本次低产品占比更可能是当日鉴权刷新未伴随实际使用，"
+                        f"而非注册机，降级为观察。"
+                    )
+                else:
+                    f["final_sev"] = f["sev"]
+                    f["repeat_note"] = None
+                continue
             if f["kind"] != "threat" or f["axis"] not in ("horiz", "vert"):
                 f["final_sev"] = f["sev"]
                 f["repeat_note"] = None
@@ -548,7 +656,7 @@ def render_server_report(server, origins, findings_by_origin, fleet_shared):
             sev = sev_max(sev, f["final_sev"])
         per_origin[o.ip] = (sev, threats, torrents)
 
-    buckets = {"MALICIOUS": [], "SUSPICIOUS": [], "WATCH": [], "CLEAN": []}
+    buckets = {"MALICIOUS": [], "SUSPICIOUS": [], "WATCH": [], "INFO": [], "CLEAN": []}
     for o in origins:
         buckets[per_origin[o.ip][0]].append(o)
     torrent_origins = [o for o in origins if per_origin[o.ip][2]]
@@ -558,6 +666,7 @@ def render_server_report(server, origins, findings_by_origin, fleet_shared):
     out.append(
         f"Origin 总数: {len(origins)} | 恶意: {len(buckets['MALICIOUS'])} | "
         f"可疑: {len(buckets['SUSPICIOUS'])} | 关注(跨天复现): {len(buckets['WATCH'])} | "
+        f"信息: {len(buckets['INFO'])} | "
         f"P2P/BT: {len(torrent_origins)} | 干净: {len(buckets['CLEAN'])}"
     )
     out.append("")
@@ -580,7 +689,8 @@ def render_server_report(server, origins, findings_by_origin, fleet_shared):
 
     for level, title in [("MALICIOUS", "MALICIOUS 详情（疑似扫描/僵尸网络探测）"),
                          ("SUSPICIOUS", "SUSPICIOUS 详情（可疑，建议人工复核）"),
-                         ("WATCH", "WATCH 详情（跨天稳定复现，疑似常驻自动化/运维，仅关注）")]:
+                         ("WATCH", "WATCH 详情（跨天稳定复现，疑似常驻自动化/运维，仅关注）"),
+                         ("INFO", "INFO 详情（信息级，探索性判定，非威胁，仅供参考）")]:
         rows = sorted(buckets[level], key=lambda x: -x.total)
         if rows:
             out.append(f"===== {title} =====")
@@ -590,7 +700,7 @@ def render_server_report(server, origins, findings_by_origin, fleet_shared):
                 out.append("")
 
     torrent_only = [o for o in torrent_origins
-                    if per_origin[o.ip][0] == "CLEAN"]
+                    if per_origin[o.ip][0] in ("CLEAN", "INFO")]
     if torrent_only:
         out.append("===== P2P/BitTorrent 标记详情（ToS 风险，非安全威胁） =====")
         for o in sorted(torrent_only, key=lambda x: -x.total):
@@ -685,7 +795,15 @@ def main():
             for o in origins:
                 all_findings[(date, server, o.ip)] = analyze_origin(o, fleet_shared_domains)
 
-    apply_cross_day(all_findings, [d for d, _dp, _ps in loaded])
+    # 每个 (server, origin IP) 在每一天的产品域名命中数，供 openai_auth 轴跨天核实使用
+    usage_by_day = defaultdict(dict)
+    for date, _dpath, per_server in loaded:
+        for server, origins in per_server.items():
+            for o in origins:
+                uh = sum(d.count for d in effective_dests(o) if d.host in OPENAI_USAGE_DOMAINS)
+                usage_by_day[(server, o.ip)][date] = uh
+
+    apply_cross_day(all_findings, [d for d, _dp, _ps in loaded], usage_by_day)
 
     # 出每天每服务器报告
     fleet_rows = []  # (date, server, oip, sev, is_torrent)
@@ -705,9 +823,10 @@ def main():
     n_mal = sum(1 for _d, _s, _i, sev, _t in fleet_rows if sev == "MALICIOUS")
     n_susp = sum(1 for _d, _s, _i, sev, _t in fleet_rows if sev == "SUSPICIOUS")
     n_watch = sum(1 for _d, _s, _i, sev, _t in fleet_rows if sev == "WATCH")
+    n_info = sum(1 for _d, _s, _i, sev, _t in fleet_rows if sev == "INFO")
     n_bt = sum(1 for _d, _s, _i, _sev, t in fleet_rows if t)
     print(f"[warning] 处理 {len(loaded)} 天。MALICIOUS={n_mal} SUSPICIOUS={n_susp} "
-          f"WATCH={n_watch} P2P/BT={n_bt}。跨天汇总: FLEET_SUMMARY_warning.txt")
+          f"WATCH={n_watch} INFO={n_info} P2P/BT={n_bt}。跨天汇总: FLEET_SUMMARY_warning.txt")
 
 
 def finding_trigger(f):
@@ -727,6 +846,9 @@ def finding_trigger(f):
     if f["axis"] == "domain_scatter":
         return (f"域名目的地分布过散 — {f['detail'].strip()}"
                 f"（阈值 不同域名≥{DOMAIN_SCATTER_MIN_DISTINCT} 且最大域名占比≤{DOMAIN_SCATTER_MAX_TOP_SHARE:.0%}）")
+    if f["axis"] == "domain_concurrency":
+        return (f"域名并发异常 — {f['detail'].strip()}"
+                f"（阈值 当日命中≥{DOMAIN_CONCURRENCY_MIN_HITS} 且并发比值≥{DOMAIN_CONCURRENCY_RATIO_MIN}）")
     return f["axis"]
 
 
@@ -757,7 +879,7 @@ def write_fleet_summary(loaded, all_findings, fleet_shared, dp_servers, fleet_sh
             if f["kind"] == "torrent":
                 torrent.append(f"  [P2P/BT] {date} {server} - {oip}\n      触发: {finding_trigger(f)}")
 
-    for sev in ["MALICIOUS", "SUSPICIOUS", "WATCH"]:
+    for sev in ["MALICIOUS", "SUSPICIOUS", "WATCH", "INFO"]:
         lines.append(f"===== {sev} 清单 =====")
         lines.extend(flagged[sev] if flagged[sev] else ["  （无）"])
         lines.append("")
