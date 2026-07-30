@@ -132,9 +132,10 @@ CLEAN  <  INFO  <  WATCH  <  SUSPICIOUS  <  MALICIOUS
    combined "auth + product" total → SUSPICIOUS. This is a **ratio-based** judgment rather than an
    absolute count: even a legitimate user behind a proxy/relay with heavy volume still sends far less
    auth traffic than actual product usage; repeatedly running the auth flow while barely touching the
-   product itself is the account-farm signature. This is the **only axis that counts domain
-   destinations** (all other axes count bare IPv4 only), and it applies solely to those two exact domain
-   allowlists, so it does not affect the overall REALITY/SNI domain exemption design.
+   product itself is the account-farm signature. This is **one of the two axes that count domain
+   destinations** (the other is domain concurrency, §5.6; every other axis counts bare IPv4 only), and
+   it applies solely to those two explicitly enumerated domain allowlists, so it does not affect the
+   overall REALITY/SNI domain exemption design.
    It does not participate in the novelty/streak escalation applied to `horiz`/`vert` inside
    `apply_cross_day` (the auth domains are a fixed handful, so there is no "target set" whose newness
    could be compared).
@@ -162,9 +163,11 @@ CLEAN  <  INFO  <  WATCH  <  SUSPICIOUS  <  MALICIOUS
    from many different real users (benign), or bulk probing / automated access across many domains.
    Likewise it only applies to domain destinations and does not affect the REALITY/SNI domain exemption;
    it does not participate in cross-day streaks.
-6. **Domain concurrency anomaly (added 2026-07-31 — the only exception for domain destinations)**:
+6. **Domain concurrency anomaly (added 2026-07-31 — the only axis that acts on *any* domain)**:
    domain destinations are otherwise immune to every scan-type threat axis in this engine (the §4
-   principle); this is the single exception. Using the timestamp field it computes
+   principle); this is the one exception that is not restricted to a fixed domain list (`openai_auth`,
+   §5.4, also counts domains but only the two explicitly enumerated sets). Using the timestamp field
+   it computes
    `count / distinct_secs` (a domain's hits that day ÷ the number of distinct seconds in which those
    hits landed) to measure "how many hits are being crammed into the same second". If a domain's daily
    hit count is ≥ `DOMAIN_CONCURRENCY_MIN_HITS` (20) and that ratio is
@@ -208,7 +211,17 @@ verdict produced by single-day counts.
 
 ## 7. False-positive-avoidance design (why it judges this way)
 
-1. **Domains are not counted** → immunity for REALITY/SNI borrowing.
+1. **Scan-type judgments do not count domains** → immunity for REALITY/SNI borrowing. The horizontal,
+   vertical, and P2P axes only ever look at bare IPv4; domain destinations never enter their counts.
+   No matter which big-brand SNI REALITY borrows or how much traffic it carries, it structurally
+   cannot trigger a scan verdict — the immunity comes from the shape of the algorithm, not from a
+   whitelist holding it back.
+   - Neither exception weakens this: `openai_auth` (§5.4) fires only on two **explicitly enumerated**
+     sets of OpenAI domains, and borrowed SNI domains are not on those lists;
+     `domain_concurrency` (§5.6) does apply to any domain, but it judges *hits crammed into the same
+     second*, not *which domain was visited* — and REALITY's heartbeat measures a constant 1.0 (low
+     frequency, never concurrent), nowhere near the 2.0 threshold. In other words: **the act of
+     REALITY borrowing an SNI produces no signal on any axis.**
 2. **Fleet-shared suppression**: if the same `(destination IP, port)` appears on
    `≥ FLEET_SHARED_MIN_SERVERS (5)` nodes → treated as a mass-deployed shared application
    (Telegram/Steam/STUN/monitoring probes/mainland ISP probe pools, etc.), listed at the end of
@@ -230,10 +243,13 @@ verdict produced by single-day counts.
 
 - The engine is **stateless**: no database, no reading of the previous `result/`; every run recomputes
   from the raw files currently on disk.
-- **It works with a single day**: the only feature that depends on history is cross-day
-  de-escalation/escalation. With just one day, stable automation cannot be proven → it will
-  conservatively show up as SUSPICIOUS (**over-report rather than under-report**), and the escalation
-  path (which needs ≥3 consecutive days) does not trigger. This is graceful degradation.
+- **It works with a single day**: only the cross-day machinery depends on history, in two places —
+  (1) cross-day de-escalation/escalation for `horiz`/`vert`, and (2) the `openai_auth` cross-day
+  real-usage verification. With just one day neither has evidence to work with: stable automation
+  cannot be proven, and genuine product usage on other days cannot be looked up → both conservatively
+  stay at SUSPICIOUS (**over-report rather than under-report**), and the escalation path (which needs
+  ≥3 consecutive days) does not trigger either. This is graceful degradation; every single-day axis
+  still works normally.
 
 ## 9. Tunable parameters (all at the top of each file)
 
@@ -293,8 +309,8 @@ was) — the reasoning is always reconstructable from the output alone.
   thresholds are unchanged; only the tier it reports at changed.
 - **New `domain_concurrency` axis**: uses `count ÷ distinct_secs` to detect hits crammed into the same
   second, rated SUSPICIOUS. Calibrated on 29635 real samples (observed ratio never exceeded 1.833;
-  REALITY's heartbeat sits at exactly 1.0). This is the only exception to domains being exempt from
-  scan-type judgments.
+  REALITY's heartbeat sits at exactly 1.0). It is the only axis that acts on any domain rather than a
+  fixed enumerated list (`openai_auth` counts domains too, but only its two allowlists).
 - **`openai_auth` gains cross-day real-usage verification**: ≥ `OPENAI_CROSSDAY_USAGE_MIN` (50)
   product-domain hits on any other date demotes the finding to WATCH, naming the day and hit count.
   This fixed a real false positive (a heavy user who happened to only refresh a token one day). The
