@@ -43,13 +43,44 @@ def _hhmmss_to_sec(s):
 HIGH_RISK_PORTS = {
     22, 23, 2323, 3389, 445, 1433, 3306, 5900, 8291, 37215,
     52869, 7547, 1900, 6379, 135, 139, 21,
+    # 2026-08-25 补充：与 classify_logs.py 同批新增（见该文件同处注释）。这些端口在
+    # 07-31~08-24 实测数据里被真实扫描者大量使用，共同点是「未授权即可 RCE / 直接
+    # 暴露管理面」。成功语境下命中更严重：意味着对方端口真的开着、连接真的建成了。
+    2375, 2376,   # Docker daemon
+    4444,         # Metasploit 默认监听
+    5601,         # Kibana
+    7001,         # WebLogic
+    9200,         # Elasticsearch
+    # 【不要加回 27017（MongoDB）】它同时落在 Steam 游戏服务器端口段 27015-27030 里，
+    # 实测造成误杀（SGSH2 10.10.17.30 打的是整个 27015-27098 段、目标全在 Valve 网段，
+    # 是玩 Steam）。详见 classify_logs.py 同处注释。
+    11211,        # memcached
+    2181,         # ZooKeeper
+    5984,         # CouchDB
+    623,          # IPMI/BMC
+    6667, 6697,   # IRC —— 僵尸网络 C2 常用
+    5432,         # PostgreSQL
 }
 TELNET_PORTS = {23, 2323}
 # (suspicious_min, malicious_min) on distinct successful raw-IP destinations.
 PORT_THRESHOLDS = {
     22: (8, 25),   # 24h 快照下，8 台起提示、25 台起判恶意；配合跨天复现豁免
+    # IRC / PostgreSQL 有一定的正常多主机用途，给更高阈值避免误杀。
+    6667: (8, 25),
+    6697: (8, 25),
+    5432: (8, 25),
+    # 7001：本机队有很大的正当共用人群（同一批华为云 IP 被多个不相关客户访问），
+    # 实测精确率 0/20、良性规模上限 15 台。按端口 22 的同一思路抬高到良性天花板之上。
+    # 详见 classify_logs.py 同处注释。
+    7001: (20, 40),
 }
 DEFAULT_THRESHOLDS = (5, 20)
+
+# 参与机队共享抑制的高危端口：与 classify_logs.py 一致（见该文件同名常量的完整理由）。
+# 摘要：telnet/RDP/SMB/Docker 这类端口正常业务根本不会连，撞车不算豁免；但下面这些
+# 端口有正当的多客户共用用途（应用面板/托管数据库/IRC/代理后端），实测端口 7001 因此
+# 在 20 个互不相关客户上误报，目标是同一批华为云 IP、单个目的地被 6 个节点共用。
+SHAREABLE_HIGH_RISK_PORTS = {7001, 5432, 6667, 6697, 5601, 9200, 2181, 5984}
 
 # 纵向单目标端口扫描（成功）。成功比失败更严重，阈值收得更紧。
 N_LOW_PORTS_SUSPICIOUS = 8
@@ -62,6 +93,32 @@ COMMON_SERVICE_PORTS = {
 TORRENT_PORTS = {6881, 6882, 6883, 6884, 6885, 6886, 6887, 6888, 6889, 6969, 1337, 51413, 6771}
 TORRENT_MIN_DISTINCT = 3
 
+# 多端口横向扫描（2026-08-25 新增，端口无关）：与 classify_logs.py 一致，见该文件同处
+# 的完整动机说明。成功语境下阈值收紧一档（扫描已得手比扫描失败更严重）。
+MULTIPORT_PORT_MIN_IPS = 3    # 一个端口要在 >= 这么多个不同 IP 上出现，才算进「扫描端口」集合
+MULTIPORT_MIN_PORTS = 3       # 单台目标 IP 被 >= 这么多个「扫描端口」打中，才算被多端口探测
+MULTIPORT_SUSPICIOUS = 6      # 有 >= 这么多台 IP 被多端口探测 → 可疑
+MULTIPORT_MALICIOUS = 15      # → 恶意
+# 三条必须的降噪，完整理由见 classify_logs.py 同处注释（含「试过而无效」的判别量清单，
+# 别再重走：核心端口占比、pairwise Jaccard、目标 IP 的 /24 聚集度，三个都无法分开
+# 真扫描与代理池）。有效的是端口语义锚点：扫描器打可利用服务，代理池打任意映射端口。
+MULTIPORT_MAX_HITS = 5        # 单个 (IP,端口) 命中超过此值 → 持续关系而非探测，不计入
+MULTIPORT_MAX_RUN = 5         # 单台 IP 的端口集里最长连号达到此值 → 端口映射网关，整台排除
+MULTIPORT_MIN_HIGHRISK = 2    # 复用端口集里至少要有这么多个 HIGH_RISK_PORTS（语义锚点）
+
+
+def _longest_port_run(ports):
+    """端口集里最长的连号长度。连号是端口映射网关的指纹（8531,8532,8533…），
+    而扫描器的服务端口清单最长只到 2（2375/2376、5003/5004 这种成对出现）。"""
+    ps = sorted(ports)
+    if not ps:
+        return 0
+    best = cur = 1
+    for a, b in zip(ps, ps[1:]):
+        cur = cur + 1 if b == a + 1 else 1
+        best = max(best, cur)
+    return best
+
 FLEET_SHARED_MIN_SERVERS = 5
 
 # OpenAI/ChatGPT 鉴权滥用（账号注册机/token 农场）检测：与 classify_logs.py 一致
@@ -72,7 +129,10 @@ OPENAI_USAGE_DOMAINS = {
     "chat.openai.com", "chatgpt.com", "api.openai.com", "platform.openai.com",
     "ios.chat.openai.com", "android.chat.openai.com", "sora.chatgpt.com", "ws.chatgpt.com",
 }
-OPENAI_AUTH_MIN_HITS = 300
+# 2026-08-25 下调 300 → 150：与 classify_logs.py 一致。07-31~08-24 全量实测，单日鉴权
+# 域名命中数的最大值只有 251，门槛 300 已高于整个总体上限，等于这条轴被静默关闭
+# （25 天 0 命中）。真正起判别作用的是产品占比（≤5%），次数门槛只用来滤小样本。
+OPENAI_AUTH_MIN_HITS = 150
 OPENAI_USAGE_MAX_RATIO = 0.05
 # 跨天真实使用核实：与 classify_logs.py 一致（见该文件同名常量注释）——若同一
 # (server, origin IP) 在其它已加载日期有 >= 此值的产品域名命中，说明是真实用户，
@@ -84,12 +144,25 @@ OPENAI_CROSSDAY_USAGE_MIN = 50
 DOMAIN_SCATTER_MIN_DISTINCT = 300
 DOMAIN_SCATTER_MAX_TOP_SHARE = 0.10
 
-# 域名并发异常：与 classify_logs.py 一致（见该文件同名常量注释）——域名目的地本来对本
-# 引擎所有威胁轴免疫，这是唯一的例外。用 count/distinct_secs 衡量同一域名当日命中是否
-# 反复砸进同一秒；实测全量数据（含已知 REALITY 借用 SNI 的 visa.cn/qualcomm.cn）该比值
-# 从未超过 1.833，REALITY 心跳本身恒为 1.0，因此不影响 REALITY/SNI 域名豁免。
-DOMAIN_CONCURRENCY_MIN_HITS = 20
-DOMAIN_CONCURRENCY_RATIO_MIN = 2.0
+# 单域名连接风暴（2026-08-25 重写，取代原「域名并发异常」轴）：与 classify_logs.py 一致，
+# 完整的推翻理由见该文件同处注释。摘要：旧的 count/distinct_secs 并发比值量的是「客户端
+# 每次事件同时开几条连接」（浏览器每主机 6+1 条 → 比值恒为 7），对时间跨度完全不敏感，
+# 在 07-31~08-24 数据上导致 info 侧 2166 条告警里绝大多数是 google/apple/netflix/微软遥测
+# 这类误杀（其余所有轴加起来才 321 条）。新规则改看持续速率 count/(末次-首次)。
+DOMAIN_STORM_MIN_HITS = 150      # 当日对单一域名的连接次数下限
+DOMAIN_STORM_MIN_RATE = 2.0      # 次/秒，count/(末次-首次) 的持续速率下限
+DOMAIN_STORM_MIN_SPAN_SEC = 20   # 时间跨度下限，排除「打开一个网页瞬间并发加载」
+
+# 挖矿池域名（2026-08-25 新增）：与 classify_logs.py 一致（见该文件同名常量注释）。
+# 摘要：必须区分「真在挖矿」（stratum 端口 / 持续会话量级）和「只是打开了矿池官网」
+# （443 端口、个位数次）。实跑发现本轴初版的 23 条命中全部是后者，判 SUSPICIOUS 过重。
+MINING_STRATUM_PORTS = {3333, 4444, 5555, 7777, 8888, 9999, 14444, 45700, 3032, 1234}
+MINING_SESSION_MIN_HITS = 50
+MINING_DOMAIN_HINTS = (
+    "stratum", "nanopool", "minexmr", "supportxmr", "hashvault", "moneroocean",
+    "2miners", "ethermine", "f2pool", "poolin", "viabtc", "herominers",
+    "zergpool", "xmrpool", "nicehash", "unmineable", "miningpoolhub",
+)
 
 # 机队共享域名白名单：与 classify_logs.py 一致（见该文件同名常量注释）。
 FLEET_SHARED_DOMAIN_MIN_SERVERS = 15
@@ -223,7 +296,7 @@ def effective_dests(origin):
     return ds
 
 
-def analyze_origin(origin, warning_status, fleet_shared_domains=frozenset()):
+def analyze_origin(origin, warning_status, fleet_shared_domains=frozenset(), fleet_shared=frozenset()):
     dests = effective_dests(origin)
     by_port = defaultdict(list)
     by_ip = defaultdict(list)
@@ -237,6 +310,11 @@ def analyze_origin(origin, warning_status, fleet_shared_domains=frozenset()):
     # --- 轴 1：横向高危端口（成功连接 = 扫描已得手）---
     for port, plist in sorted(by_port.items()):
         if port not in HIGH_RISK_PORTS:
+            continue
+        if port in SHAREABLE_HIGH_RISK_PORTS:
+            # 这些端口有正当的多客户共用用途，剔除机队共用的目的地后再看规模
+            plist = [d for d in plist if (d.host, port) not in fleet_shared]
+        if not plist:
             continue
         n_ips = len(plist)
         counts = [d.count for d in plist]
@@ -310,6 +388,63 @@ def analyze_origin(origin, warning_status, fleet_shared_domains=frozenset()):
                 "reason": reason,
             })
 
+    # --- 轴 8：多端口横向扫描（端口无关）---
+    # 判据见 classify_logs.py 同处注释：只看「同一份端口清单被套用到多台不相关主机」
+    # 这个形状，不依赖高危端口白名单是否收录，补的正是白名单覆盖不到的盲区。
+    # 同时剔除机队共享的 (IP, 端口)——批量部署的共享应用不是扫描目标。高危端口本来
+    # 就不计入 fleet_shared，所以攻击目标撞车不会被豁免。
+    port_ips = defaultdict(set)
+    for d in dests:
+        if (is_ipv4(d.host) and d.port not in COMMON_SERVICE_PORTS
+                and d.port not in TORRENT_PORTS and (d.host, d.port) not in fleet_shared
+                and d.count <= MULTIPORT_MAX_HITS):
+            port_ips[d.port].add(d.host)
+    scan_ports = {p for p, ips in port_ips.items() if len(ips) >= MULTIPORT_PORT_MIN_IPS}
+    multi_hosts = {}
+    # 语义锚点：端口集里没有足够的已知高危服务端口 → 不是在探服务，是代理/端口映射，整条不成立。
+    if len(scan_ports & HIGH_RISK_PORTS) >= MULTIPORT_MIN_HIGHRISK:
+        for ip, dlist in by_ip.items():
+            hit_ports = {d.port for d in dlist
+                         if d.port in scan_ports and (ip, d.port) not in fleet_shared
+                         and d.count <= MULTIPORT_MAX_HITS}
+            if len(hit_ports) < MULTIPORT_MIN_PORTS:
+                continue
+            if _longest_port_run(hit_ports) >= MULTIPORT_MAX_RUN:
+                continue      # 连号端口块 = 端口映射网关，不是扫描目标
+            if not (hit_ports & HIGH_RISK_PORTS):
+                continue      # 这台目标身上没有任何高危服务端口 → 不是在探它的服务
+            multi_hosts[ip] = hit_ports
+    if len(multi_hosts) >= MULTIPORT_SUSPICIOUS:
+        n_hosts = len(multi_hosts)
+        ports_sample = sorted(scan_ports)[:12]
+        ports_str = ", ".join(str(p) for p in ports_sample)
+        if len(scan_ports) > len(ports_sample):
+            ports_str += f" …（共 {len(scan_ports)} 个）"
+        hr = sorted(scan_ports & HIGH_RISK_PORTS)
+        hr_str = ", ".join(str(p) for p in hr[:8])
+        sev = "MALICIOUS" if n_hosts >= MULTIPORT_MALICIOUS else "SUSPICIOUS"
+        tail = (
+            "规模已达恶意判定线。" if sev == "MALICIOUS"
+            else f"未达 {MULTIPORT_MALICIOUS} 台的恶意线，但形状已明确是扫描，建议人工复核。"
+        )
+        findings.append({
+            "axis": "multiport", "port": None, "target": None,
+            "key_set": frozenset(multi_hosts),
+            "sev": sev, "kind": "threat",
+            "detail": (f"  多端口横向扫描（成功）: {n_hosts} 台公网 IP 各被 >={MULTIPORT_MIN_PORTS} 个"
+                       f"复用端口成功连上（复用端口: {ports_str}）"),
+            "reason": (
+                f"该 origin 当日对 {n_hosts} 台互不相关的公网 IP 各自**成功建成**了至少 "
+                f"{MULTIPORT_MIN_PORTS} 个端口的连接，且这些端口在多台目标之间重复复用"
+                f"（{ports_str}），其中包含已知高危服务端口 {hr_str}。这是「拿一份固定端口清单横扫"
+                f"一批主机、逐个试可利用服务」的扫描器指纹，而且是已经得手的那部分——对方端口真的"
+                f"开着、连接真的建成了。判定已排除三类良性形状：单个目的地命中超过 {MULTIPORT_MAX_HITS} 次的"
+                f"（持续关系而非探测）、端口集是连号块的（每端口映射一个后端出口的代理网关）、"
+                f"以及端口集里凑不出 {MULTIPORT_MIN_HIGHRISK} 个高危服务端口的（机场/代理订阅用的是任意"
+                f"映射端口，不是可利用服务）。P2P 也不会触发，因为 BT 对端端口随机、不在对端之间复用。{tail}"
+            ),
+        })
+
     # --- 轴 3：P2P/BitTorrent ---
     bt_ips = set()
     for port in TORRENT_PORTS:
@@ -382,26 +517,74 @@ def analyze_origin(origin, warning_status, fleet_shared_domains=frozenset()):
                 ),
             })
 
-    # --- 轴 6：域名并发异常（域名目的地唯一的例外，其它轴仍对域名免疫）---
+    # --- 轴 6：单域名连接风暴（取代原「域名并发异常」，见常量处的推翻理由）---
     for d in dests:
-        if is_ipv4(d.host) or d.distinct_secs is None or d.count < DOMAIN_CONCURRENCY_MIN_HITS:
+        if is_ipv4(d.host) or d.first_s is None or d.count < DOMAIN_STORM_MIN_HITS:
             continue
-        ratio = d.count / d.distinct_secs
-        if ratio >= DOMAIN_CONCURRENCY_RATIO_MIN:
+        span = d.last_s - d.first_s
+        if span < DOMAIN_STORM_MIN_SPAN_SEC:
+            continue
+        rate = d.count / span
+        if rate >= DOMAIN_STORM_MIN_RATE:
             findings.append({
-                "axis": "domain_concurrency", "port": None, "target": d.host,
+                "axis": "domain_storm", "port": None, "target": d.host,
                 "key_set": frozenset([d.host]),
                 "sev": "SUSPICIOUS", "kind": "threat",
-                "detail": (f"  域名并发异常: {d.host} 当日成功连接 {d.count} 次仅落在 {d.distinct_secs} 个不同秒内"
-                           f"（并发比值 {ratio:.2f}）"),
+                "detail": (f"  单域名连接风暴: {d.host} 当日成功连接 {d.count} 次压缩在 {span} 秒内"
+                           f"（持续 {rate:.1f} 次/秒）"),
                 "reason": (
-                    f"该 origin 当日成功连接域名 {d.host} {d.count} 次，但只分布在 {d.distinct_secs} 个"
-                    f"不同的秒内（并发比值 {ratio:.2f}）。用全量真实数据校准过：不管是 REALITY 借用 SNI"
-                    f"的心跳流量还是普通网页/CDN 访问，这个比值从未超过 1.833——同一秒内反复并发命中"
-                    f"同一域名不是浏览器/正常客户端的行为模式，更像脚本/工具在对该域名发起多线程并发"
-                    f"连接。这是域名目的地在本引擎里唯一参与判定的信号（其它轴仍对域名免疫，不影响"
-                    f"REALITY/SNI 借用域名的整体豁免——REALITY 心跳低频且从不并发，比值恒为 1，不会"
-                    f"触发这条）。"
+                    f"该 origin 当日成功连接域名 {d.host} {d.count} 次，全部压缩在 {span} 秒的窗口内，"
+                    f"持续速率 {rate:.1f} 次/秒。判据是**速率**而不是并发度：正常浏览器每主机会同时开"
+                    f"6-7 条连接、双栈客户端每次事件开 2 条，这些「并发」本身完全良性，所以本轴不看"
+                    f"并发比值（旧规则正是栽在这里，把网页广告加载、安卓 token 刷新、微软遥测全判成了"
+                    f"可疑）。真正异常的是把成百上千次连接持续砸向同一个域名——遥测/保活/REALITY 心跳"
+                    f"摊到全天不足 1 次/秒，正常网页加载总量又达不到 {DOMAIN_STORM_MIN_HITS} 次，能同时"
+                    f"越过这三道门槛的只有刷接口、暴力破解或自动化批量请求。这是域名目的地在本引擎里"
+                    f"参与判定的两个例外之一（另一个是挖矿池域名），不影响 REALITY/SNI 域名豁免。"
+                ),
+            })
+
+    # --- 轴 9：挖矿池域名（域名清单式判定，与 openai_auth 同类）---
+    mining_hits = {}
+    mining_session = False
+    for d in dests:
+        if is_ipv4(d.host):
+            continue
+        low = d.host.lower()
+        for hint in MINING_DOMAIN_HINTS:
+            if hint in low:
+                mining_hits[d.host] = mining_hits.get(d.host, 0) + d.count
+                if d.port in MINING_STRATUM_PORTS or d.count >= MINING_SESSION_MIN_HITS:
+                    mining_session = True
+                break
+    if mining_hits:
+        listed = ", ".join(f"{h}({c}次)" for h, c in
+                           sorted(mining_hits.items(), key=lambda kv: -kv[1])[:6])
+        if mining_session:
+            findings.append({
+                "axis": "mining", "port": None, "target": None,
+                "key_set": frozenset(mining_hits),
+                "sev": "SUSPICIOUS", "kind": "threat",
+                "detail": f"  挖矿会话: 成功连接 {len(mining_hits)} 个矿池域名（{listed}）",
+                "reason": (
+                    f"该 origin 当日**成功连接**了已知加密货币矿池域名：{listed}，且命中落在 stratum"
+                    f"挖矿端口上或量级已达持续会话（≥{MINING_SESSION_MIN_HITS} 次）——矿池会话真的建立了，"
+                    f"这是**这台机器本身在挖矿**的形状，而不是有人打开了矿池网页。可能是主机被植入挖矿"
+                    f"木马，也可能是客户自行挖矿（多数 IDC 服务条款禁止）。域名目的地对本引擎其它威胁轴"
+                    f"仍然免疫，不影响 REALITY/SNI 豁免。"
+                ),
+            })
+        else:
+            findings.append({
+                "axis": "mining_web", "port": None, "target": None,
+                "key_set": frozenset(mining_hits),
+                "sev": "INFO", "kind": "threat",
+                "detail": f"  矿池网站访问: {len(mining_hits)} 个矿池域名（{listed}）",
+                "reason": (
+                    f"该 origin 当日访问了矿池相关域名：{listed}，但**只在 80/443 上、量级很小**，"
+                    f"没有落在 stratum 挖矿端口、也达不到持续会话的量级（≥{MINING_SESSION_MIN_HITS} 次）。"
+                    f"这是「有人用浏览器看了矿池网站/自己的矿池面板」的形状，不是这台机器在挖矿。"
+                    f"故归为 INFO（信息级），不计入威胁告警。"
                 ),
             })
 
@@ -441,7 +624,9 @@ def build_fleet_index(days):
             for o in origins:
                 for d in effective_dests(o):
                     if is_ipv4(d.host):
-                        if d.port not in HIGH_RISK_PORTS:
+                        # 高危端口原则上不进共享索引；SHAREABLE_HIGH_RISK_PORTS 例外。
+                        if (d.port not in HIGH_RISK_PORTS
+                                or d.port in SHAREABLE_HIGH_RISK_PORTS):
                             dp_servers[(d.host, d.port)].add(server)
                     else:
                         domain_servers[d.host].add(server)
@@ -493,7 +678,7 @@ def apply_cross_day(all_findings, all_dates, usage_by_day=None):
                     f["final_sev"] = f["sev"]
                     f["repeat_note"] = None
                 continue
-            if f["kind"] != "threat" or f["axis"] not in ("horiz", "vert"):
+            if f["kind"] != "threat" or f["axis"] not in ("horiz", "vert", "multiport"):
                 f["final_sev"] = f["sev"]
                 f["repeat_note"] = None
                 continue
@@ -741,19 +926,29 @@ def load_warning_status(date):
         wlog = importlib.import_module("classify_logs")
     except Exception:
         return status
+    per_server = {}
     for path in sorted(wdir.glob("*.txt")):
         try:
-            origins = wlog.parse_file(path)
+            per_server[path.stem] = wlog.parse_file(path)
         except Exception:
             continue
+    # 机队上下文：此前这里直接 analyze_origin(o) 不带任何机队参数，等于关掉了机队共享
+    # 抑制，使 xref 比真正的 warning 跑更敏感。这里用**当天** warning 全量现算一份索引补上。
+    # 仍是近似——真正的 warning 跑是跨全部已加载日期建索引，这里只有一天，但比完全没有
+    # 上下文准得多。xref 只在 warning 侧判 MALICIOUS/SUSPICIOUS 时才起作用，宁可稍紧。
+    try:
+        fshared, _dp, fdomains, _ds = wlog.build_fleet_index([(date, per_server)])
+    except Exception:
+        fshared, fdomains = frozenset(), frozenset()
+    for server, origins in per_server.items():
         for o in origins:
-            findings = wlog.analyze_origin(o)
+            findings = wlog.analyze_origin(o, fdomains, fshared)
             sev = "CLEAN"
             for f in findings:
                 if f["kind"] == "threat":
                     sev = wlog.sev_max(sev, f["sev"])
             if sev != "CLEAN":
-                status[(path.stem.upper(), o.ip)] = sev
+                status[(server.upper(), o.ip)] = sev
     return status
 
 
@@ -792,7 +987,8 @@ def main():
     for date, _dpath, per_server, wstatus in loaded:
         for server, origins in per_server.items():
             for o in origins:
-                all_findings[(date, server, o.ip)] = analyze_origin(o, wstatus, fleet_shared_domains)
+                all_findings[(date, server, o.ip)] = analyze_origin(
+                    o, wstatus, fleet_shared_domains, fleet_shared)
 
     # 每个 (server, origin IP) 在每一天的产品域名命中数，供 openai_auth 轴跨天核实使用
     usage_by_day = defaultdict(dict)
@@ -847,9 +1043,18 @@ def finding_trigger(f):
     if f["axis"] == "domain_scatter":
         return (f"域名目的地分布过散 — {f['detail'].strip()}"
                 f"（阈值 不同域名≥{DOMAIN_SCATTER_MIN_DISTINCT} 且最大域名占比≤{DOMAIN_SCATTER_MAX_TOP_SHARE:.0%}）")
-    if f["axis"] == "domain_concurrency":
-        return (f"域名并发异常 — {f['detail'].strip()}"
-                f"（阈值 当日命中≥{DOMAIN_CONCURRENCY_MIN_HITS} 且并发比值≥{DOMAIN_CONCURRENCY_RATIO_MIN}）")
+    if f["axis"] == "multiport":
+        return (f"多端口横向扫描（成功）— {f['detail'].strip()}"
+                f"（阈值 被多端口探测的 IP 数 可疑≥{MULTIPORT_SUSPICIOUS}/恶意≥{MULTIPORT_MALICIOUS}）")
+    if f["axis"] == "domain_storm":
+        return (f"单域名连接风暴 — {f['detail'].strip()}"
+                f"（阈值 当日≥{DOMAIN_STORM_MIN_HITS} 次、跨度≥{DOMAIN_STORM_MIN_SPAN_SEC} 秒"
+                f"且持续≥{DOMAIN_STORM_MIN_RATE} 次/秒）")
+    if f["axis"] == "mining":
+        return (f"挖矿会话 — {f['detail'].strip()}"
+                f"（命中 stratum 端口或 ≥{MINING_SESSION_MIN_HITS} 次持续会话）")
+    if f["axis"] == "mining_web":
+        return f"矿池网站访问（信息级，非挖矿）— {f['detail'].strip()}"
     return f["axis"]
 
 
